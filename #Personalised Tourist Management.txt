@@ -1,0 +1,296 @@
+# === Personalised Tourist Management System (Jupyter Notebook) ===
+# Run cell-by-cell or paste entire block in a notebook.
+# Requirements: pandas, numpy, scikit-learn, matplotlib
+# Install if missing: !pip install pandas numpy scikit-learn matplotlib
+
+import random
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import MinMaxScaler
+import matplotlib.pyplot as plt
+
+seed = 42
+random.seed(seed)
+np.random.seed(seed)
+
+# -------------------------
+# 1) Synthetic dataset
+# -------------------------
+num_attractions = 100
+num_users = 200
+# Attraction catalogue
+names = [f"Attraction_{i+1}" for i in range(num_attractions)]
+categories = ['museum','beach','park','historic','food','market','adventure','religious','nature','art']
+cities = ['Paris','Rome','Bangkok','New York','Tokyo','Istanbul','London','Barcelona','Sydney','Mumbai']
+
+def gen_tags(cat):
+    base = cat
+    extras = random.sample(['waterfront','family','nightlife','budget','luxury','photography','romantic','local','guided','hike','viewpoint','wildlife'], k=3)
+    return " ".join([base] + extras)
+
+attractions = []
+for i in range(num_attractions):
+    cat = random.choice(categories)
+    city = random.choice(cities)
+    # Simulate feature: popularity score
+    popularity = np.clip(np.random.normal(loc=0.5, scale=0.18), 0.05, 0.99)
+    tags = gen_tags(cat)
+    lat = round(np.random.uniform(-90, 90), 4)
+    lon = round(np.random.uniform(-180, 180), 4)
+    attractions.append({
+        'attr_id': i,
+        'name': names[i],
+        'category': cat,
+        'city': city,
+        'tags': tags,
+        'lat': lat,
+        'lon': lon,
+        'popularity': popularity
+    })
+
+attractions_df = pd.DataFrame(attractions)
+
+# -------------------------
+# 2) Simulate user profiles + implicit ratings
+# -------------------------
+# Each user has a preference vector for categories and tags, and a "location city" preference
+users = []
+for u in range(num_users):
+    preferred_categories = random.sample(categories, k=3)  # top 3 types
+    preferred_city = random.choice(cities + [None]*4)  # sometimes no strong city preference
+    # interest intensity per category
+    cat_scores = {c: (2.0 if c in preferred_categories else 1.0) * np.random.uniform(0.4,1.6) for c in categories}
+    users.append({
+        'user_id': u,
+        'preferred_categories': preferred_categories,
+        'preferred_city': preferred_city,
+        'cat_scores': cat_scores
+    })
+users_df = pd.DataFrame([{'user_id':u['user_id'],'preferred_categories':u['preferred_categories'],
+                          'preferred_city':u['preferred_city']} for u in users])
+
+# Generate implicit ratings (0-5)
+rows = []
+for u in users:
+    # each user interacts with between 10 and 30 attractions
+    interacted = random.sample(range(num_attractions), k=random.randint(12,28))
+    for attr in interacted:
+        a = attractions[attr]
+        base = a['popularity']  # attraction baseline
+        cat_pref = u['cat_scores'][a['category']]
+        city_boost = 0.2 if (u['preferred_city'] == a['city'] and u['preferred_city'] is not None) else 0.0
+        # user interest score
+        score = base * cat_pref + city_boost + np.random.normal(0, 0.12)
+        # map to 0-5 rating
+        rating = np.clip((score / 1.8) * 5, 0, 5)   # 1.8 normalizer chosen experimentally
+        # add some discretization
+        rating = round(rating * 2) / 2.0
+        rows.append({'user_id': u['user_id'], 'attr_id': attr, 'rating': rating})
+ratings_df = pd.DataFrame(rows)
+
+# Quick dataset view
+print("Attractions:", attractions_df.shape, "Users:", users_df.shape, "Ratings:", ratings_df.shape)
+display(attractions_df.head())
+display(ratings_df.sample(6))
+
+# -------------------------
+# 3) Content-based recommender
+#    Use tags + category + city as textual features -> TF-IDF -> cosine similarity
+# -------------------------
+attractions_df['text_feature'] = (attractions_df['category'] + " " +
+                                  attractions_df['city'].fillna('') + " " +
+                                  attractions_df['tags'])
+
+tfidf = TfidfVectorizer(max_features=5000, ngram_range=(1,2))
+tfidf_matrix = tfidf.fit_transform(attractions_df['text_feature'])
+
+# Precompute attraction-to-attraction similarity (content similarity)
+content_sim = cosine_similarity(tfidf_matrix, tfidf_matrix)
+
+def recommend_content_based(user_id, top_n=10):
+    # Build a user profile vector by weighted average of items they've rated
+    user_ratings = ratings_df[ratings_df.user_id == user_id]
+    if user_ratings.empty:
+        # cold start: return globally popular attractions
+        return attractions_df.sort_values('popularity', ascending=False).head(top_n)[['attr_id','name','category','city']]
+
+    # weight items by rating
+    item_indices = user_ratings['attr_id'].values
+    ratings = user_ratings['rating'].values
+    # create profile as weighted sum of TF-IDF rows
+    profile = np.zeros(tfidf_matrix.shape[1])
+    for idx, r in zip(item_indices, ratings):
+        profile += r * tfidf_matrix[idx].toarray().ravel()
+    # similarity between profile and all items
+    sims = cosine_similarity([profile], tfidf_matrix).ravel()
+    # exclude already rated items
+    rated_set = set(item_indices)
+    rec_idxs = np.argsort(-sims)
+    recs = []
+    for idx in rec_idxs:
+        if idx not in rated_set:
+            recs.append((idx, sims[idx]))
+        if len(recs) >= top_n:
+            break
+    rec_df = attractions_df.iloc[[r[0] for r in recs]].copy()
+    rec_df['score'] = [r[1] for r in recs]
+    return rec_df[['attr_id','name','category','city','score']]
+
+# -------------------------
+# 4) Collaborative recommender (Matrix factorization with TruncatedSVD on user-item matrix)
+# ------------------------
+# Build user-item matrix (fill 0 for missing = not interacted)
+user_item = ratings_df.pivot_table(index='user_id', columns='attr_id', values='rating', fill_value=0)
+
+# SVD to get latent factors
+n_components = 30  # latent factors
+svd = TruncatedSVD(n_components=n_components, random_state=seed)
+user_factors = svd.fit_transform(user_item)         # users x latent
+item_factors = svd.components_.T                    # items x latent
+
+# Reconstruct predicted ratings (users x items)
+predicted = np.dot(user_factors, item_factors.T)
+pred_df = pd.DataFrame(predicted, index=user_item.index, columns=user_item.columns)
+
+def recommend_collaborative(user_id, top_n=10):
+    if user_id not in pred_df.index:
+        # cold-start: return globally popular
+        return attractions_df.sort_values('popularity', ascending=False).head(top_n)[['attr_id','name','category','city']]
+    user_pred = pred_df.loc[user_id]
+    # mask items the user has already rated/interacted
+    rated = set(ratings_df[ratings_df.user_id==user_id]['attr_id'].values)
+    recs = user_pred.sort_values(ascending=False).index.tolist()
+    recs = [r for r in recs if r not in rated]
+    rec_df = attractions_df.set_index('attr_id').loc[recs[:top_n]].reset_index()
+    rec_df['pred_score'] = user_pred.loc[recs[:top_n]].values
+    return rec_df[['attr_id','name','category','city','pred_score']]
+
+# -------------------------
+# 5) Hybrid recommender: combine normalized content & collaborative scores
+# -------------------------
+# Precompute normalized content similarity to each item for each user as a score:
+# For each user, we compute content recommendations' score per item (similarity to profile)
+def compute_content_scores_for_all_users():
+    # For each user, create a profile vector and compute similarity to all items
+    users_content_scores = {}
+    for u in users_df['user_id']:
+        user_ratings = ratings_df[ratings_df.user_id == u]
+        if user_ratings.empty:
+            users_content_scores[u] = np.array(attractions_df['popularity'])  # fallback
+            continue
+        profile = np.zeros(tfidf_matrix.shape[1])
+        for idx, r in zip(user_ratings['attr_id'].values, user_ratings['rating'].values):
+            profile += r * tfidf_matrix[idx].toarray().ravel()
+        sims = cosine_similarity([profile], tfidf_matrix).ravel()
+        users_content_scores[u] = sims
+    return users_content_scores
+
+users_content_scores = compute_content_scores_for_all_users()
+
+# Normalize collaborative and content scores then combine
+scaler = MinMaxScaler()
+
+# Pre-normalize item popularity (for fallback)
+pop_norm = scaler.fit_transform(attractions_df[['popularity']]).ravel()
+
+def recommend_hybrid(user_id, top_n=10, alpha=0.6):
+    """
+    alpha : weight for collaborative; (1-alpha) weight for content
+    """
+    # Get collaborative scores (pred_df row) and content scores
+    if user_id in pred_df.index:
+        coll = pred_df.loc[user_id].values
+    else:
+        coll = np.array([0.0]*num_attractions)
+    content = users_content_scores.get(user_id, pop_norm.copy())
+    # Normalize both to [0,1]
+    coll_norm = scaler.fit_transform(coll.reshape(-1,1)).ravel()
+    # content may be negative or small numeric -> scale
+    content_norm = scaler.fit_transform(content.reshape(-1,1)).ravel()
+    hybrid_score = alpha * coll_norm + (1-alpha) * content_norm
+    # exclude already rated
+    rated = set(ratings_df[ratings_df.user_id==user_id]['attr_id'].values)
+    rec_indices_sorted = np.argsort(-hybrid_score)
+    recs = []
+    for idx in rec_indices_sorted:
+        if idx not in rated:
+            recs.append((idx, hybrid_score[idx]))
+        if len(recs) >= top_n:
+            break
+    rec_df = attractions_df.iloc[[r[0] for r in recs]].copy()
+    rec_df['hybrid_score'] = [r[1] for r in recs]
+    return rec_df[['attr_id','name','category','city','hybrid_score']]
+
+# -------------------------
+# 6) Simple evaluation: Precision@k (holdout)
+# -------------------------
+def precision_at_k(user_id, recommender_fn, k=10):
+    # holdout: take last rated attraction of user as test, others as train simulated (only for users with >=2 ratings)
+    ur = ratings_df[ratings_df.user_id==user_id].sort_values('rating', ascending=False)
+    if ur.shape[0] < 2:
+        return None
+    test_item = ur.iloc[0]['attr_id']  # treat top rated as ground truth
+    # For our simple evaluation we temporarily remove this rating from the known set
+    global ratings_df, user_item, pred_df, users_content_scores
+    # Create a local copy to avoid re-training heavy stuff: use existing models but pretend the user hasn't rated test_item
+    # Generate recommendations and check if test_item is in top-k
+    recs = recommender_fn(user_id, top_n=k)
+    recommended_ids = recs['attr_id'].tolist()
+    return 1.0 if test_item in recommended_ids else 0.0
+
+# Evaluate across a sample of users
+sample_users = random.sample(list(users_df['user_id']), k=50)
+results = {'user':[], 'content_prec':[], 'collab_prec':[], 'hybrid_prec':[]}
+for u in sample_users:
+    pc = precision_at_k(u, recommend_content_based, k=10)
+    pco = precision_at_k(u, recommend_collaborative, k=10)
+    ph = precision_at_k(u, lambda uid, top_n: recommend_hybrid(uid, top_n, alpha=0.6), k=10)
+    if pc is not None:
+        results['user'].append(u)
+        results['content_prec'].append(pc)
+        results['collab_prec'].append(pco)
+        results['hybrid_prec'].append(ph)
+eval_df = pd.DataFrame(results)
+print("Average Precision@10 across sample users:")
+display(eval_df[['content_prec','collab_prec','hybrid_prec']].mean())
+
+# -------------------------
+# 7) Example usage
+# -------------------------
+example_user = random.choice(list(users_df['user_id']))
+print(f"Example recommendations for user {example_user}\nUser's known preferences (sample):")
+display(ratings_df[ratings_df.user_id==example_user].merge(attractions_df[['attr_id','name']], left_on='attr_id', right_on='attr_id').head())
+
+print("\n-- Content-based recommendations --")
+display(recommend_content_based(example_user, top_n=8))
+
+print("\n-- Collaborative recommendations --")
+display(recommend_collaborative(example_user, top_n=8))
+
+print("\n-- Hybrid recommendations (alpha=0.6) --")
+display(recommend_hybrid(example_user, top_n=8, alpha=0.6))
+
+# -------------------------
+# 8) (Optional) Visualise category distribution of recommended items
+# -------------------------
+rec = recommend_hybrid(example_user, top_n=30, alpha=0.6)
+cat_counts = rec['category'].value_counts()
+plt.figure(figsize=(8,4))
+cat_counts.plot(kind='bar')
+plt.title(f"Category distribution of hybrid top-30 recs for user {example_user}")
+plt.xlabel("Category")
+plt.ylabel("Count")
+plt.show()
+
+# -------------------------
+# 9) Notes & next steps you can add for your mini-project
+# -------------------------
+# - Replace synthetic data with a real dataset (e.g. TripAdvisor-like logs, Yelp, or a custom CSV)
+# - Improve collaborative model: use implicit MF libraries (e.g. LightFM, implicit), or Surprise for SVD++
+# - Add geoposition-aware filtering (distance-based personalization)
+# - Add context: time-of-day, season, budget -> context-aware recommender
+# - Build a simple Flask/Streamlit UI to demonstrate recommendations to users
+# - Evaluate with better metrics (Recall@k, NDCG@k) and proper train/test splits (temporal split)
